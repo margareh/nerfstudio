@@ -40,10 +40,12 @@ from nerfstudio.data.dataparsers.phototourism_dataparser import (
 from nerfstudio.data.dataparsers.scannet_dataparser import ScanNetDataParserConfig
 from nerfstudio.data.dataparsers.sdfstudio_dataparser import SDFStudioDataParserConfig
 from nerfstudio.data.dataparsers.sitcoms3d_dataparser import Sitcoms3DDataParserConfig
+from nerfstudio.data.dataparsers.lunarlab_dataparser import LunarLabDataParserConfig
 from nerfstudio.plugins.registry_dataparser import discover_dataparsers
 
 dataparsers = {
     "nerfstudio-data": NerfstudioDataParserConfig(),
+    "lunarlab-data": LunarLabDataParserConfig(),
     "minimal-parser": MinimalDataParserConfig(),
     "arkit-data": ARKitScenesDataParserConfig(),
     "blender-data": BlenderDataParserConfig(),
