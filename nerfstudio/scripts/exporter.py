@@ -115,6 +115,8 @@ class ExportPointCloud(Exporter):
     """Number of rays to evaluate per batch. Decrease if you run out of memory."""
     std_ratio: float = 10.0
     """Threshold based on STD of the average distances across the point cloud to remove outliers."""
+    depth_var_name: str = "depth_var"
+    """Name of the depth variance output"""
 
     def main(self) -> None:
         """Export point cloud."""
@@ -146,16 +148,22 @@ class ExportPointCloud(Exporter):
             bounding_box_min=self.bounding_box_min,
             bounding_box_max=self.bounding_box_max,
             std_ratio=self.std_ratio,
+            depth_var_name=self.depth_var_name,
         )
         torch.cuda.empty_cache()
+
+        # give point cloud a different name if variance is included
+        pcl_name = "point_cloud_var.ply" if self.depth_var_name is not None else "point_cloud.ply"
 
         CONSOLE.print(f"[bold green]:white_check_mark: Generated {pcd}")
         CONSOLE.print("Saving Point Cloud...")
         tpcd = o3d.t.geometry.PointCloud.from_legacy(pcd)
         # The legacy PLY writer converts colors to UInt8,
         # let us do the same to save space.
-        tpcd.point.colors = (tpcd.point.colors * 255).to(o3d.core.Dtype.UInt8)  # type: ignore
-        o3d.t.io.write_point_cloud(str(self.output_dir / "point_cloud.ply"), tpcd)
+        # only doing this if the color isn't the variance
+        if self.depth_var_name is None:
+            tpcd.point.colors = (tpcd.point.colors * 255).to(o3d.core.Dtype.UInt8)  # type: ignore
+        o3d.t.io.write_point_cloud(str(self.output_dir / pcl_name), tpcd)
         print("\033[A\033[A")
         CONSOLE.print("[bold green]:white_check_mark: Saving Point Cloud")
 

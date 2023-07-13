@@ -75,6 +75,7 @@ def _render_trajectory_video(
     image_format: Literal["jpeg", "png"] = "jpeg",
     jpeg_quality: int = 100,
     colormap_options: colormaps.ColormapOptions = colormaps.ColormapOptions(),
+    separate: bool = False
 ) -> None:
     """Helper function to create a video of the spiral trajectory.
 
@@ -105,9 +106,16 @@ def _render_trajectory_video(
         TimeRemainingColumn(elapsed_when_finished=False, compact=False),
         TimeElapsedColumn(),
     )
+
+    # create output directory if it doesn't exist
     output_image_dir = output_filename.parent / output_filename.stem
     if output_format == "images":
         output_image_dir.mkdir(parents=True, exist_ok=True)
+        if separate:
+            for name in rendered_output_names:
+                output_dir = output_image_dir / name
+                output_dir.mkdir(exist_ok=True)
+                
     if output_format == "video":
         # make the folder if it doesn't exist
         output_filename.parent.mkdir(parents=True, exist_ok=True)
@@ -117,6 +125,12 @@ def _render_trajectory_video(
         # but then we would have to move all of mdat to insert metadata atom
         # (unless we reserve enough space to overwrite with our uuid tag,
         # but we don't know how big the video file will be, so it's not certain!)
+        
+        if separate:
+            for name in rendered_output_names:
+                output_dir = output_filename.parent / name
+                output_dir.mkdir(exist_ok=True)
+
 
     with ExitStack() as stack:
         writer = None
@@ -157,27 +171,52 @@ def _render_trajectory_video(
                         .cpu()
                         .numpy()
                     )
-                    render_image.append(output_image)
-                render_image = np.concatenate(render_image, axis=1)
-                if output_format == "images":
-                    if image_format == "png":
-                        media.write_image(output_image_dir / f"{camera_idx:05d}.png", render_image, fmt="png")
-                    if image_format == "jpeg":
-                        media.write_image(
-                            output_image_dir / f"{camera_idx:05d}.jpg", render_image, fmt="jpeg", quality=jpeg_quality
-                        )
-                if output_format == "video":
-                    if writer is None:
-                        render_width = int(render_image.shape[1])
-                        render_height = int(render_image.shape[0])
-                        writer = stack.enter_context(
-                            media.VideoWriter(
-                                path=output_filename,
-                                shape=(render_height, render_width),
-                                fps=fps,
+                    if separate == False:
+                        render_image.append(output_image)
+                    else:
+                        if output_format == "images":
+                            if image_format == "png":
+                                media.write_image(output_image_dir / rendered_output_name / f"{camera_idx:05d}.png", output_image, fmt="png")
+                            if image_format == "jpeg":
+                                media.write_image(
+                                    output_image_dir / rendered_output_name / f"{camera_idx:05d}.jpg", output_image, fmt="jpeg", quality=jpeg_quality
+                                )
+
+                        if output_format == "video":
+                            if writer is None:
+                                render_width = int(output_image.shape[1])
+                                render_height = int(output_image.shape[0])
+                                writer = stack.enter_context(
+                                    media.VideoWriter(
+                                        path=output_filename.parent / rendered_output_name / output_filename.name,
+                                        shape=(render_height, render_width),
+                                        fps=fps,
+                                    )
+                                )
+                            writer.add_image(output_image)
+
+                if separate == False:
+                    render_image = np.concatenate(render_image, axis=1)
+                    if output_format == "images":
+                        if image_format == "png":
+                            media.write_image(output_image_dir / f"{camera_idx:05d}.png", render_image, fmt="png")
+                        if image_format == "jpeg":
+                            media.write_image(
+                                output_image_dir / f"{camera_idx:05d}.jpg", render_image, fmt="jpeg", quality=jpeg_quality
                             )
-                        )
-                    writer.add_image(render_image)
+
+                    if output_format == "video":
+                        if writer is None:
+                            render_width = int(render_image.shape[1])
+                            render_height = int(render_image.shape[0])
+                            writer = stack.enter_context(
+                                media.VideoWriter(
+                                    path=output_filename,
+                                    shape=(render_height, render_width),
+                                    fps=fps,
+                                )
+                            )
+                        writer.add_image(render_image)
 
     table = Table(
         title=None,
@@ -419,6 +458,51 @@ class RenderCameraPath(BaseRender):
                 shutil.rmtree(left_eye_path.parent, ignore_errors=True)
             CONSOLE.print("[bold green]Final ODS Render Complete")
 
+@dataclass
+class RenderRGBVarPath(BaseRender):
+    """Render a camera path generated by the viewer or blender add-on."""
+
+    rendered_output_names: List[str] = field(default_factory=lambda: ["rgb_var"])
+    """Name of the renderer outputs to use. rgb, depth, etc. concatenates them along y axis"""
+    camera_path_filename: Path = Path("camera_path.json")
+    """Filename of the camera path to render."""
+    output_format: Literal["images", "video"] = "images"
+    """How to save output data."""
+
+    def main(self) -> None:
+        """Main function."""
+        _, pipeline, _, _ = eval_setup(
+            self.load_config,
+            eval_num_rays_per_chunk=self.eval_num_rays_per_chunk,
+            test_mode="inference",
+        )
+
+        install_checks.check_ffmpeg_installed()
+
+        with open(self.camera_path_filename, "r", encoding="utf-8") as f:
+            camera_path = json.load(f)
+        seconds = camera_path["seconds"]
+        crop_data = get_crop_from_json(camera_path)
+        camera_path = get_path_from_json(camera_path)
+
+        # add mp4 suffix to video output if none is specified
+        if self.output_format == "video" and str(self.output_path.suffix) == "":
+            self.output_path = self.output_path.with_suffix(".mp4")
+
+        _render_trajectory_video(
+            pipeline,
+            camera_path,
+            output_filename=self.output_path,
+            rendered_output_names=self.rendered_output_names,
+            rendered_resolution_scaling_factor=1.0 / self.downscale_factor,
+            crop_data=crop_data,
+            seconds=seconds,
+            output_format=self.output_format,
+            image_format=self.image_format,
+            jpeg_quality=self.jpeg_quality,
+            colormap_options=self.colormap_options,
+        )
+
 
 @dataclass
 class RenderInterpolated(BaseRender):
@@ -515,11 +599,202 @@ class SpiralRender(BaseRender):
         )
 
 
+@dataclass
+class RenderDepthPath(BaseRender):
+    """Render depth along a camera path as images."""
+
+    rendered_output_names: List[str] = field(default_factory=lambda: ["depth"])
+    """Name of the renderer outputs to use. rgb, depth, etc. concatenates them along y axis"""
+    camera_path_filename: Path = Path("camera_path.json")
+    """Filename of the camera path to render."""
+    output_format: Literal["images", "video"] = "images"
+    """How to save output data."""
+
+    def main(self) -> None:
+        """Main function."""
+        _, pipeline, _, _ = eval_setup(
+            self.load_config,
+            eval_num_rays_per_chunk=self.eval_num_rays_per_chunk,
+            test_mode="inference",
+        )
+
+        install_checks.check_ffmpeg_installed()
+
+        with open(self.camera_path_filename, "r", encoding="utf-8") as f:
+            camera_path = json.load(f)
+        seconds = camera_path["seconds"]
+        crop_data = get_crop_from_json(camera_path)
+        camera_path = get_path_from_json(camera_path)
+
+        # add mp4 suffix to video output if none is specified
+        if self.output_format == "video" and str(self.output_path.suffix) == "":
+            self.output_path = self.output_path.with_suffix(".mp4")
+
+        _render_trajectory_video(
+            pipeline,
+            camera_path,
+            output_filename=self.output_path,
+            rendered_output_names=self.rendered_output_names,
+            rendered_resolution_scaling_factor=1.0 / self.downscale_factor,
+            crop_data=crop_data,
+            seconds=seconds,
+            output_format=self.output_format,
+            image_format=self.image_format,
+            jpeg_quality=self.jpeg_quality,
+            colormap_options=self.colormap_options,
+        )
+
+@dataclass
+class RenderDepthVarPath(BaseRender):
+    """Render depth along a camera path as images."""
+
+    rendered_output_names: List[str] = field(default_factory=lambda: ["depth_var"])
+    """Name of the renderer outputs to use. rgb, depth, etc. concatenates them along y axis"""
+    camera_path_filename: Path = Path("camera_path.json")
+    """Filename of the camera path to render."""
+    output_format: Literal["images", "video"] = "images"
+    """How to save output data."""
+
+    def main(self) -> None:
+        """Main function."""
+        _, pipeline, _, _ = eval_setup(
+            self.load_config,
+            eval_num_rays_per_chunk=self.eval_num_rays_per_chunk,
+            test_mode="inference",
+        )
+
+        install_checks.check_ffmpeg_installed()
+
+        with open(self.camera_path_filename, "r", encoding="utf-8") as f:
+            camera_path = json.load(f)
+        seconds = camera_path["seconds"]
+        crop_data = get_crop_from_json(camera_path)
+        camera_path = get_path_from_json(camera_path)
+
+        # add mp4 suffix to video output if none is specified
+        if self.output_format == "video" and str(self.output_path.suffix) == "":
+            self.output_path = self.output_path.with_suffix(".mp4")
+
+        _render_trajectory_video(
+            pipeline,
+            camera_path,
+            output_filename=self.output_path,
+            rendered_output_names=self.rendered_output_names,
+            rendered_resolution_scaling_factor=1.0 / self.downscale_factor,
+            crop_data=crop_data,
+            seconds=seconds,
+            output_format=self.output_format,
+            image_format=self.image_format,
+            jpeg_quality=self.jpeg_quality,
+            colormap_options=self.colormap_options,
+        )
+
+
+@dataclass
+class RenderOpacityPath(BaseRender):
+    """Render opacity along a camera path as images."""
+
+    rendered_output_names: List[str] = field(default_factory=lambda: ["accumulated"])
+    """Name of the renderer outputs to use. rgb, depth, etc. concatenates them along y axis"""
+    camera_path_filename: Path = Path("camera_path.json")
+    """Filename of the camera path to render."""
+    output_format: Literal["images", "video"] = "images"
+    """How to save output data."""
+
+    def main(self) -> None:
+        """Main function."""
+        _, pipeline, _, _ = eval_setup(
+            self.load_config,
+            eval_num_rays_per_chunk=self.eval_num_rays_per_chunk,
+            test_mode="inference",
+        )
+
+        install_checks.check_ffmpeg_installed()
+
+        with open(self.camera_path_filename, "r", encoding="utf-8") as f:
+            camera_path = json.load(f)
+        seconds = camera_path["seconds"]
+        crop_data = get_crop_from_json(camera_path)
+        camera_path = get_path_from_json(camera_path)
+
+        # add mp4 suffix to video output if none is specified
+        if self.output_format == "video" and str(self.output_path.suffix) == "":
+            self.output_path = self.output_path.with_suffix(".mp4")
+
+        _render_trajectory_video(
+            pipeline,
+            camera_path,
+            output_filename=self.output_path,
+            rendered_output_names=self.rendered_output_names,
+            rendered_resolution_scaling_factor=1.0 / self.downscale_factor,
+            crop_data=crop_data,
+            seconds=seconds,
+            output_format=self.output_format,
+            image_format=self.image_format,
+            jpeg_quality=self.jpeg_quality,
+            colormap_options=self.colormap_options,
+        )
+
+@dataclass
+class RenderLunarLabPath(BaseRender):
+    """Render all aspects of lunar lab data"""
+
+    rendered_output_names: List[str] = field(default_factory=lambda: ["rgb", "depth", "rgb_var", "depth_var", "accumulation"])
+    """Name of renderer outputs to use"""
+
+    camera_path_filename: Path = Path("camera_path.json")
+    """Filename of camera path to render"""
+
+    output_format: Literal["images", "video"] = "images"
+    """How to save output data"""
+
+    def main(self) -> None:
+        """Main function"""
+        _, pipeline, _, _ = eval_setup(
+            self.load_config,
+            eval_num_rays_per_chunk = self.eval_num_rays_per_chunk,
+            test_mode = "inference"
+        )
+        install_checks.check_ffmpeg_installed()
+
+        # load the camera path
+        with open(self.camera_path_filename, "r", encoding="utf-8") as f:
+            camera_path = json.load(f)
+        seconds = camera_path["seconds"]
+        crop_data = get_crop_from_json(camera_path)
+        camera_path = get_path_from_json(camera_path)
+
+        # add mp4 suffix to video output if none is specified
+        if self.output_format == "video" and str(self.output_path.suffix) == "":
+            self.output_path = self.output_path.with_suffix(".mp4")
+
+        _render_trajectory_video(
+            pipeline,
+            camera_path,
+            output_filename=self.output_path,
+            rendered_output_names=self.rendered_output_names,
+            rendered_resolution_scaling_factor=1.0 / self.downscale_factor,
+            crop_data=crop_data,
+            seconds=seconds,
+            output_format=self.output_format,
+            image_format=self.image_format,
+            jpeg_quality=self.jpeg_quality,
+            colormap_options=self.colormap_options,
+            separate=True
+        )
+
+
+
 Commands = tyro.conf.FlagConversionOff[
     Union[
         Annotated[RenderCameraPath, tyro.conf.subcommand(name="camera-path")],
+        Annotated[RenderRGBVarPath, tyro.conf.subcommand(name="rgb-var")],
         Annotated[RenderInterpolated, tyro.conf.subcommand(name="interpolate")],
         Annotated[SpiralRender, tyro.conf.subcommand(name="spiral")],
+        Annotated[RenderDepthPath, tyro.conf.subcommand(name="depth")],
+        Annotated[RenderDepthVarPath, tyro.conf.subcommand(name="depth-var")],
+        Annotated[RenderOpacityPath, tyro.conf.subcommand(name="opacity")],
+        Annotated[RenderLunarLabPath, tyro.conf.subcommand(name="lunarlab")]
     ]
 ]
 

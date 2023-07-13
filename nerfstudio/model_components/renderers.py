@@ -142,7 +142,66 @@ class RGBRenderer(nn.Module):
         if not self.training:
             torch.clamp_(rgb, min=0.0, max=1.0)
         return rgb
+    
 
+class RGBVarRenderer(nn.Module):
+    """Render RGB variance"""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    @classmethod
+    def combine_rgb(
+        cls,
+        rgb: Float[Tensor, "*bs num_samples 3"],
+        weights: Float[Tensor, "*bs num_samples 1"],
+        ray_indices: Optional[Int[Tensor, "num_samples"]] = None,
+        num_rays: Optional[int] = None,
+    ) -> Float[Tensor, "*bs 3"]:
+        
+        if ray_indices is not None and num_rays is not None:
+            # expected value of color
+            exp_rgb = nerfacc.accumulate_along_rays(
+                weights[..., 0], values=rgb, ray_indices=ray_indices, n_rays=num_rays
+            )
+
+            # reshape and get difference for variance
+            S = int(rgb.shape[0] / num_rays)
+            rgb_rshp = rgb.reshape((num_rays, S, 3))
+            exp_rgb = exp_rgb.unsqueeze(-1)
+            diff = (rgb_rshp - exp_rgb)**2
+            diff = diff.reshape((num_rays * S, 3))
+
+            # variance of color
+            var_rgb = nerfacc.accumulate_along_rays(
+                weights[...,0], values=diff, ray_indices=ray_indices, n_rays=num_rays
+            )
+        else:
+            # expected value of color
+            exp_rgb = torch.sum(weights * rgb, dim=-2, keepdims=True)
+            # variance of color
+            var_rgb = torch.sum(weights * ((rgb - exp_rgb)**2), -2)
+
+        return var_rgb
+
+    def forward(
+        self,
+        rgb: Float[Tensor, "*bs num_samples 3"],
+        weights: Float[Tensor, "*bs num_samples 1"],
+        ray_indices: Optional[Int[Tensor, "num_samples"]] = None,
+        num_rays: Optional[int] = None,
+    ) -> Float[Tensor, "*bs 3"]:
+
+        if not self.training:
+            rgb = torch.nan_to_num(rgb)
+        var_rgb = self.combine_rgb(
+            rgb, weights, ray_indices=ray_indices, num_rays=num_rays
+        )
+        # if not self.training:
+            # torch.clamp_(rgb, min=0.0, max=1.0)
+            # var_rgb /= torch.max()
+        return var_rgb
+    
 
 class SHRenderer(nn.Module):
     """Render RGB value from spherical harmonics.
@@ -295,6 +354,59 @@ class DepthRenderer(nn.Module):
             return depth
 
         raise NotImplementedError(f"Method {self.method} not implemented")
+    
+
+class DepthVarRenderer(nn.Module):
+    """Render the variance in depth using expected value for depth"""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def forward(
+        self,
+        weights: Float[Tensor, "*batch num_samples 1"],
+        ray_samples: RaySamples,
+        ray_indices: Optional[Int[Tensor, "num_samples"]] = None,
+        num_rays: Optional[int] = None,
+    ) -> Float[Tensor, "*batch 1"]:
+        
+        eps = 1e-10
+        steps = (ray_samples.frustums.starts + ray_samples.frustums.ends) / 2
+
+        if ray_indices is not None and num_rays is not None:
+            # Necessary for packed samples from volumetric ray sampler
+            depth = nerfacc.accumulate_along_rays(
+                weights[..., 0], values=steps, ray_indices=ray_indices, n_rays=num_rays
+            )
+            accumulation = nerfacc.accumulate_along_rays(
+                weights[..., 0], values=None, ray_indices=ray_indices, n_rays=num_rays
+            )
+            depth = depth / (accumulation + eps)
+
+            # compute difference for variance calc
+            S = int(steps.shape[0] / num_rays)
+            steps_rshp = steps.reshape((num_rays, S, 1))
+            depth = depth.unsqueeze(-1)
+            diff = (steps_rshp - depth)**2
+            diff = diff.reshape((num_rays * S, 1))
+            
+            depth_var = nerfacc.accumulate_along_rays(
+                weights[...,0], values=diff, ray_indices=ray_indices, n_rays=num_rays
+            )
+            depth_var = depth_var / (accumulation + eps)
+        else:
+            denom = torch.sum(weights, -2) + eps
+            depth = torch.sum(weights * steps, dim=-2) / denom
+            depth = depth.unsqueeze(1)
+            # print(denom.shape)
+            # print(depth.shape)
+            # print(weights.shape)
+            # print(steps.shape)
+            depth_var = torch.sum(weights * ((steps - depth)**2), dim=-2) / denom
+
+        # depth = torch.clip(depth, steps.min(), steps.max())
+
+        return depth_var
 
 
 class UncertaintyRenderer(nn.Module):

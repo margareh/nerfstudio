@@ -92,6 +92,7 @@ def generate_point_cloud(
     bounding_box_min: Tuple[float, float, float] = (-1.0, -1.0, -1.0),
     bounding_box_max: Tuple[float, float, float] = (1.0, 1.0, 1.0),
     std_ratio: float = 10.0,
+    depth_var_name: Optional[str] = None,
 ) -> o3d.geometry.PointCloud:
     """Generate a point cloud from a nerf.
 
@@ -107,6 +108,7 @@ def generate_point_cloud(
         bounding_box_min: Minimum of the bounding box.
         bounding_box_max: Maximum of the bounding box.
         std_ratio: Threshold based on STD of the average distances across the point cloud to remove outliers.
+        depth_var_name: Name of the depth variance output
 
     Returns:
         Point cloud.
@@ -122,10 +124,12 @@ def generate_point_cloud(
     points = []
     rgbs = []
     normals = []
+    vars = []
     with progress as progress_bar:
         task = progress_bar.add_task("Generating Point Cloud", total=num_points)
         while not progress_bar.finished:
             normal = None
+            depth_var = None
 
             with torch.no_grad():
                 ray_bundle, _ = pipeline.datamanager.next_train(0)
@@ -142,6 +146,11 @@ def generate_point_cloud(
                 sys.exit(1)
             rgb = outputs[rgb_output_name]
             depth = outputs[depth_output_name]
+
+            if depth_var_name is not None:
+                depth_var = outputs[depth_var_name]
+                point_var = ray_bundle.directions * depth_var
+
             if normal_output_name is not None:
                 if normal_output_name not in outputs:
                     CONSOLE.rule("Error", style="red")
@@ -153,6 +162,7 @@ def generate_point_cloud(
                     torch.min(normal) >= 0.0 and torch.max(normal) <= 1.0
                 ), "Normal values from method output must be in [0, 1]"
                 normal = (normal * 2.0) - 1.0
+
             point = ray_bundle.origins + ray_bundle.directions * depth
 
             if use_bounding_box:
@@ -164,20 +174,33 @@ def generate_point_cloud(
                 mask = torch.all(torch.concat([point > comp_l, point < comp_m], dim=-1), dim=-1)
                 point = point[mask]
                 rgb = rgb[mask]
+                if depth_var is not None:
+                    point_var = point_var[mask]
                 if normal is not None:
                     normal = normal[mask]
 
             points.append(point)
             rgbs.append(rgb)
+    
+            if depth_var is not None:
+                vars.append(point_var)
+    
             if normal is not None:
                 normals.append(normal)
             progress.advance(task, point.shape[0])
+    
     points = torch.cat(points, dim=0)
     rgbs = torch.cat(rgbs, dim=0)
-
+    
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points.double().cpu().numpy())
-    pcd.colors = o3d.utility.Vector3dVector(rgbs.double().cpu().numpy())
+
+    # put variance in color channels instead of rgb if desired
+    if depth_var_name is not None:
+        vars = torch.cat(vars, dim=0)
+        pcd.colors = o3d.utility.Vector3dVector(vars.double().cpu().numpy())
+    else:
+        pcd.colors = o3d.utility.Vector3dVector(rgbs.double().cpu().numpy())
 
     ind = None
     if remove_outliers:
