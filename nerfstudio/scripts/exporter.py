@@ -115,7 +115,7 @@ class ExportPointCloud(Exporter):
     """Number of rays to evaluate per batch. Decrease if you run out of memory."""
     std_ratio: float = 10.0
     """Threshold based on STD of the average distances across the point cloud to remove outliers."""
-    depth_var_name: str = "depth_var"
+    depth_var_name: str = None
     """Name of the depth variance output"""
 
     def main(self) -> None:

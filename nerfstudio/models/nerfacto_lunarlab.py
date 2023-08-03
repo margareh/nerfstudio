@@ -126,6 +126,8 @@ class NerfactoLLModelConfig(ModelConfig):
     """Which implementation to use for the model."""
     appearance_embed_dim: int = 32
     """Dimension of the appearance embedding."""
+    depth_render_type: str = "median"
+    """Type of depth rendering to use (median or expected)"""
 
 
 class NerfactoLLModel(Model):
@@ -219,7 +221,7 @@ class NerfactoLLModel(Model):
         self.renderer_rgb = RGBRenderer(background_color=self.config.background_color)
         self.renderer_rgbvar = RGBVarRenderer()
         self.renderer_accumulation = AccumulationRenderer()
-        self.renderer_depth = DepthRenderer(method="expected")
+        self.renderer_depth = DepthRenderer(method=self.config.depth_render_type)
         self.renderer_depthvar = DepthVarRenderer()
         self.renderer_normals = NormalsRenderer()
 
