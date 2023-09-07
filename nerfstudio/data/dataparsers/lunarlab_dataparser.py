@@ -174,6 +174,7 @@ class LunarLab(DataParser):
         Different number of image and depth filenames.
         You should check that depth_file_path is specified for every frame (or zero frames) in transforms.json.
         """
+        print(len(depth_filenames))
 
         has_split_files_spec = any(f"{split}_filenames" in meta for split in ("train", "val", "test"))
         if f"{split}_filenames" in meta:
