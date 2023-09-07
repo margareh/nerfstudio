@@ -19,12 +19,12 @@ NeRF implementation that combines many recent advancements.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Tuple, Type
+from typing import Dict, List, Literal, Tuple, Type, Optional
 
 import numpy as np
 import torch
 from torch.nn import Parameter
-from torchmetrics import PeakSignalNoiseRatio
+from torchmetrics.image import PeakSignalNoiseRatio
 from torchmetrics.functional import structural_similarity_index_measure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
@@ -34,6 +34,7 @@ from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.field_components.spatial_distortions import SceneContraction
 from nerfstudio.fields.density_fields import HashMLPDensityField
 from nerfstudio.fields.nerfacto_field import NerfactoField
+from nerfstudio.fields.visibility_field import VisibilityField
 from nerfstudio.model_components.losses import (
     MSELoss,
     distortion_loss,
@@ -43,7 +44,7 @@ from nerfstudio.model_components.losses import (
     scale_gradients_by_distance_squared,
 )
 from nerfstudio.model_components.ray_samplers import ProposalNetworkSampler, UniformSampler
-from nerfstudio.model_components.renderers import AccumulationRenderer, DepthRenderer, NormalsRenderer, RGBRenderer, RGBVarRenderer, DepthVarRenderer
+from nerfstudio.model_components.renderers import AccumulationRenderer, DepthRenderer, NormalsRenderer, RGBRenderer, RGBVarRenderer, DepthVarRenderer, VisibilityRenderer
 from nerfstudio.model_components.scene_colliders import NearFarCollider
 from nerfstudio.model_components.shaders import NormalsShader
 from nerfstudio.models.base_model import Model, ModelConfig
@@ -70,7 +71,7 @@ class NerfactoLLModelConfig(ModelConfig):
     num_levels: int = 16
     """Number of levels of the hashmap for the base mlp."""
     base_res: int = 16
-    """Resolution of the base grid for the hasgrid."""
+    """Resolution of the base grid for the hashgrid."""
     max_res: int = 2048
     """Maximum resolution of the hashmap for the base mlp."""
     log2_hashmap_size: int = 19
@@ -126,8 +127,8 @@ class NerfactoLLModelConfig(ModelConfig):
     """Which implementation to use for the model."""
     appearance_embed_dim: int = 32
     """Dimension of the appearance embedding."""
-    depth_render_type: str = "median"
-    """Type of depth rendering to use (median or expected)"""
+    depth_method: Literal["median", "expected"] = "median"
+    """Median or expected depth from the depth renderer."""
 
 
 class NerfactoLLModel(Model):
@@ -154,6 +155,8 @@ class NerfactoLLModel(Model):
             hidden_dim=self.config.hidden_dim,
             num_levels=self.config.num_levels,
             max_res=self.config.max_res,
+            base_res=self.config.base_res,
+            features_per_level=self.config.features_per_level,
             log2_hashmap_size=self.config.log2_hashmap_size,
             hidden_dim_color=self.config.hidden_dim_color,
             hidden_dim_transient=self.config.hidden_dim_transient,
@@ -178,6 +181,10 @@ class NerfactoLLModel(Model):
                 **prop_net_args,
                 implementation=self.config.implementation,
             )
+            # this can be set by the pipeline
+            # if set, then we create a visibility output
+            self.visibility_field = Optional[VisibilityField] = None
+
             self.proposal_networks.append(network)
             self.density_fns.extend([network.density_fn for _ in range(num_prop_nets)])
         else:
@@ -221,8 +228,11 @@ class NerfactoLLModel(Model):
         self.renderer_rgb = RGBRenderer(background_color=self.config.background_color)
         self.renderer_rgbvar = RGBVarRenderer()
         self.renderer_accumulation = AccumulationRenderer()
-        self.renderer_depth = DepthRenderer(method=self.config.depth_render_type)
+        self.renderer_depth = DepthRenderer(method=self.config.depth_method)
+        self.renderer_depth_expected = DepthRenderer(method="expected")
+        self.renderer_depth_median = DepthRenderer(method="median")
         self.renderer_depthvar = DepthVarRenderer()
+        self.renderer_visibility = VisibilityRenderer(method="median")
         self.renderer_normals = NormalsRenderer()
 
         # shaders
@@ -235,6 +245,7 @@ class NerfactoLLModel(Model):
         self.psnr = PeakSignalNoiseRatio(data_range=1.0)
         self.ssim = structural_similarity_index_measure
         self.lpips = LearnedPerceptualImagePatchSimilarity(normalize=True)
+        self.step = 0
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         param_groups = {}
@@ -253,6 +264,7 @@ class NerfactoLLModel(Model):
             def set_anneal(step):
                 # https://arxiv.org/pdf/2111.12077.pdf eq. 18
                 train_frac = np.clip(step / N, 0, 1)
+                self.step = step
 
                 def bias(x, b):
                     return b * x / ((b - 1) * x + 1)
@@ -278,17 +290,20 @@ class NerfactoLLModel(Model):
 
     def get_outputs(self, ray_bundle: RayBundle):
         ray_samples: RaySamples
-        ray_samples, weights_list, ray_samples_list = self.proposal_sampler(ray_bundle, density_fns=self.density_fns)
+        ray_samples, densities_list, weights_list, ray_samples_list = self.proposal_sampler(ray_bundle, density_fns=self.density_fns)
         field_outputs = self.field.forward(ray_samples, compute_normals=self.config.predict_normals)
         if self.config.use_gradient_scaling:
             field_outputs = scale_gradients_by_distance_squared(field_outputs, ray_samples)
 
+        densities_list.append(field_outputs[FieldHeadNames.DENSITY])
         weights = ray_samples.get_weights(field_outputs[FieldHeadNames.DENSITY])
         weights_list.append(weights)
         ray_samples_list.append(ray_samples)
 
         rgb = self.renderer_rgb(rgb=field_outputs[FieldHeadNames.RGB], weights=weights)
-        depth = self.renderer_depth(weights=weights, ray_samples=ray_samples)
+        with torch.no_grad():
+            depth = self.renderer_depth(weights=weights, ray_samples=ray_samples)
+        expected_depth = self.renderer_depth_expected(weights=weights, ray_samples=ray_samples)
         accumulation = self.renderer_accumulation(weights=weights)
         rgb_var = self.renderer_rgbvar(rgb=field_outputs[FieldHeadNames.RGB], weights=weights)
         depth_var = self.renderer_depthvar(weights=weights, ray_samples=ray_samples)
@@ -297,9 +312,19 @@ class NerfactoLLModel(Model):
             "rgb": rgb,
             "accumulation": accumulation,
             "depth": depth,
+            "expected_depth": expected_depth,
             "rgb_var": rgb_var,
             "depth_var": depth_var
         }
+
+        if self.visibility_field is not None:
+            assert isinstance(self.visibility_field, VisibilityField), "self.visibility_field must be a VisibilityField"
+            visibility_samples = self.visibility_field.forward(ray_samples_list[-1])
+            visibility = self.renderer_visibility(weights=weights, visibility_samples=visibility_samples)
+            visibility = visibility.float() / len(
+                self.visibility_field.c2ws
+            )  # range [0, 1] where 1 is seen by all cameras
+            outputs["visibility"] = visibility
 
         if self.config.predict_normals:
             normals = self.renderer_normals(normals=field_outputs[FieldHeadNames.NORMALS], weights=weights)
@@ -308,6 +333,7 @@ class NerfactoLLModel(Model):
             outputs["pred_normals"] = self.normals_shader(pred_normals)
         # These use a lot of GPU memory, so we avoid storing them for eval.
         if self.training:
+            outputs["densities_list"] = densities_list
             outputs["weights_list"] = weights_list
             outputs["ray_samples_list"] = ray_samples_list
 
@@ -329,8 +355,13 @@ class NerfactoLLModel(Model):
 
     def get_metrics_dict(self, outputs, batch):
         metrics_dict = {}
-        image = batch["image"].to(self.device)
-        metrics_dict["psnr"] = self.psnr(outputs["rgb"], image)
+        # image = batch["image"].to(self.device)
+        # metrics_dict["psnr"] = self.psnr(outputs["rgb"], image)
+        gt_rgb = batch["image"].to(self.device)  # RGB or RGBA image
+        gt_rgb = self.renderer_rgb.blend_background(gt_rgb)  # Blend if RGBA
+        predicted_rgb = outputs["rgb"]
+        metrics_dict["psnr"] = self.psnr(predicted_rgb, gt_rgb)
+
         if self.training:
             metrics_dict["distortion"] = distortion_loss(outputs["weights_list"], outputs["ray_samples_list"])
         return metrics_dict
@@ -338,7 +369,13 @@ class NerfactoLLModel(Model):
     def get_loss_dict(self, outputs, batch, metrics_dict=None):
         loss_dict = {}
         image = batch["image"].to(self.device)
-        loss_dict["rgb_loss"] = self.rgb_loss(image, outputs["rgb"])
+        pred_rgb, gt_rgb = self.renderer_rgb.blend_background_for_loss_computation(
+            pred_image=outputs["rgb"],
+            pred_accumulation=outputs["accumulation"],
+            gt_image=image,
+        )
+
+        loss_dict["rgb_loss"] = self.rgb_loss(gt_rgb, pred_rgb)
         if self.training:
             loss_dict["interlevel_loss"] = self.config.interlevel_loss_mult * interlevel_loss(
                 outputs["weights_list"], outputs["ray_samples_list"]
@@ -360,25 +397,30 @@ class NerfactoLLModel(Model):
     def get_image_metrics_and_images(
         self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
     ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
-        image = batch["image"].to(self.device)
-        rgb = outputs["rgb"]
+        # image = batch["image"].to(self.device)
+        # rgb = outputs["rgb"]
+        gt_rgb = batch["image"].to(self.device)
+        predicted_rgb = outputs["rgb"]  # Blended with background (black if random background)
+        gt_rgb = self.renderer_rgb.blend_background(gt_rgb)
         acc = colormaps.apply_colormap(outputs["accumulation"])
         depth = colormaps.apply_depth_colormap(
             outputs["depth"],
             accumulation=outputs["accumulation"],
         )
 
-        combined_rgb = torch.cat([image, rgb], dim=1)
+        combined_rgb = torch.cat([gt_rgb, predicted_rgb], dim=1)
         combined_acc = torch.cat([acc], dim=1)
         combined_depth = torch.cat([depth], dim=1)
 
         # Switch images from [H, W, C] to [1, C, H, W] for metrics computations
-        image = torch.moveaxis(image, -1, 0)[None, ...]
-        rgb = torch.moveaxis(rgb, -1, 0)[None, ...]
+        # image = torch.moveaxis(image, -1, 0)[None, ...]
+        # rgb = torch.moveaxis(rgb, -1, 0)[None, ...]
+        gt_rgb = torch.moveaxis(gt_rgb, -1, 0)[None, ...]
+        predicted_rgb = torch.moveaxis(predicted_rgb, -1, 0)[None, ...]
 
-        psnr = self.psnr(image, rgb)
-        ssim = self.ssim(image, rgb)
-        lpips = self.lpips(image, rgb)
+        psnr = self.psnr(gt_rgb, predicted_rgb)
+        ssim = self.ssim(gt_rgb, predicted_rgb)
+        lpips = self.lpips(gt_rgb, predicted_rgb)
 
         # all of these metrics will be logged as scalars
         metrics_dict = {"psnr": float(psnr.item()), "ssim": float(ssim)}  # type: ignore
