@@ -17,7 +17,7 @@ Callback code used for training iterations
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, InitVar
 from enum import Enum, auto
 from inspect import signature
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
@@ -43,6 +43,7 @@ class TrainingCallbackAttributes:
     """gradient scalers"""
     pipeline: Optional["Pipeline"]  # Prevent circular import.
     """reference to training pipeline"""
+    viewer_state: Optional[InitVar]
 
 
 class TrainingCallbackLocation(Enum):

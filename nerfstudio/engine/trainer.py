@@ -150,7 +150,7 @@ class Trainer:
             test_mode=test_mode,
             world_size=self.world_size,
             local_rank=self.local_rank,
-            grad_scaler=self.grad_scaler,
+            # grad_scaler=self.grad_scaler,
         )
         self.optimizers = self.setup_optimizers()
 
@@ -189,6 +189,7 @@ class Trainer:
                 optimizers=self.optimizers,
                 grad_scaler=self.grad_scaler,
                 pipeline=self.pipeline,
+                viewer_state=self.viewer_state,
             )
         )
 
